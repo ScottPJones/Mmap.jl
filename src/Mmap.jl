@@ -2,7 +2,10 @@
 
 module Mmap
 
-const PAGESIZE = Int(@unix ? ccall(:jl_getpagesize, Clong, ()) : ccall(:jl_getallocationgranularity, Clong, ()))
+using Compat
+# export mmap
+
+const PAGESIZE = @compat Int(@unix ? ccall(:jl_getpagesize, Clong, ()) : ccall(:jl_getallocationgranularity, Clong, ()))
 
 # for mmaps not backed by files
 type AnonymousMmap <: IO
@@ -23,12 +26,12 @@ gethandle(io::AnonymousMmap) = INVALID_HANDLE_VALUE
 # platform-specific mmap utilities
 @unix_only begin
 
-const PROT_READ     = Cint(1)
-const PROT_WRITE    = Cint(2)
-const MAP_SHARED    = Cint(1)
-const MAP_PRIVATE   = Cint(2)
-const MAP_ANONYMOUS = @osx? Cint(0x1000) : Cint(0x20)
-const F_GETFL       = Cint(3)
+const PROT_READ     = convert(Cint,1)
+const PROT_WRITE    = convert(Cint,2)
+const MAP_SHARED    = convert(Cint,1)
+const MAP_PRIVATE   = convert(Cint,2)
+const MAP_ANONYMOUS = convert(Cint, @osx? 0x1000 : 0x20)
+const F_GETFL       = convert(Cint,3)
 
 gethandle(io::IO) = fd(io)
 
@@ -68,16 +71,16 @@ end # @unix_only
 
 @windows_only begin
 
-const PAGE_READONLY          = UInt32(0x02)
-const PAGE_READWRITE         = UInt32(0x04)
-const PAGE_WRITECOPY         = UInt32(0x08)
-const PAGE_EXECUTE_READ      = UInt32(0x20)
-const PAGE_EXECUTE_READWRITE = UInt32(0x40)
-const PAGE_EXECUTE_WRITECOPY = UInt32(0x80)
-const FILE_MAP_COPY          = UInt32(0x01)
-const FILE_MAP_WRITE         = UInt32(0x02)
-const FILE_MAP_READ          = UInt32(0x04)
-const FILE_MAP_EXECUTE       = UInt32(0x20)
+const PAGE_READONLY          = @compat UInt32(0x02)
+const PAGE_READWRITE         = @compat UInt32(0x04)
+const PAGE_WRITECOPY         = @compat UInt32(0x08)
+const PAGE_EXECUTE_READ      = @compat UInt32(0x20)
+const PAGE_EXECUTE_READWRITE = @compat UInt32(0x40)
+const PAGE_EXECUTE_WRITECOPY = @compat UInt32(0x80)
+const FILE_MAP_COPY          = @compat UInt32(0x01)
+const FILE_MAP_WRITE         = @compat UInt32(0x02)
+const FILE_MAP_READ          = @compat UInt32(0x04)
+const FILE_MAP_EXECUTE       = @compat UInt32(0x20)
 
 function gethandle(io::IO)
     handle = Base._get_osfhandle(RawFD(fd(io))).handle
@@ -86,178 +89,116 @@ function gethandle(io::IO)
 end
 
 settings(sh::AnonymousMmap) = utf16(sh.name), sh.readonly, sh.create
-settings(io::IO) = Ptr{Cwchar_t}(C_NULL), isreadonly(io), true
+settings(io::IO) = convert(Ptr{Cwchar_t},C_NULL), isreadonly(io), true
 end # @windows_only
 
 # core impelementation of mmap
-immutable Array{T,N} <: AbstractArray{T,N}
-    array::Base.Array{T,N} # array with data from memory-mapped region
-    iswritable::Bool
+function mmap{T,N}(io::IO, ::Type{T}=UInt8, dims::NTuple{N,Integer}=(filesize(io)-position(io),), offset::Integer=position(io); grow::Bool=true, shared::Bool=true)
+    # check inputs
+    isopen(io) || throw(ArgumentError("$io must be open to mmap"))
+    isbits(T)  || throw(ArgumentError("unable to mmap $T; must satisfy isbits(T) == true"))
 
-    function Mmap.Array{T,N}(::Type{T}, io::IO, dims::NTuple{N,Integer}=(filesize(io),), offset::Integer=position(io); grow::Bool=true, shared::Bool=true)
-        # check inputs
-        isopen(io) || throw(ArgumentError("$io must be open to mmap"))
+    len = prod(dims) * sizeof(T)
+    len > 0 || throw(ArgumentError("requested size must be > 0, got $len"))
+    len < typemax(Int) - PAGESIZE || throw(ArgumentError("requested size must be < $(typemax(Int)-PAGESIZE), got $len"))
 
-        len = prod(dims) * sizeof(T)
-        len > 0 || throw(ArgumentError("requested size must be > 0, got $len"))
-        len < typemax(Int) - PAGESIZE || throw(ArgumentError("requested size must be < $(typemax(Int)-PAGESIZE), got $len"))
+    offset >= 0 || throw(ArgumentError("requested offset must be ≥ 0, got $offset"))
 
-        offset >= 0 || throw(ArgumentError("requested offset must be ≥ 0, got $offset"))
+    # shift `offset` to start of page boundary
+    offset_page::FileOffset = div(offset, PAGESIZE) * PAGESIZE
+    # add (offset - offset_page) to `len` to get total length of memory-mapped region
+    mmaplen = (offset - offset_page) + len
 
-        # shift `offset` to start of page boundary
-        offset_page::FileOffset = div(offset, PAGESIZE) * PAGESIZE
-        # add (offset - offset_page) to `len` to get total length of memory-mapped region
-        mmaplen = (offset - offset_page) + len
+    file_desc = gethandle(io)
+    # platform-specific mmapping
+     @unix_only begin
+        prot, flags, iswrite = settings(file_desc, shared)
+        iswrite && grow && grow!(io, offset, len)
+        # mmap the file
+        ptr = ccall(:jl_mmap, Ptr{Void}, (Ptr{Void}, Csize_t, Cint, Cint, Cint, FileOffset), C_NULL, mmaplen, prot, flags, file_desc, offset_page)
+        systemerror("memory mapping failed", reinterpret(Int,ptr) == -1)
+    end # @unix_only
 
-        file_desc = gethandle(io)
-        # platform-specific mmapping
-         @unix_only begin
-            prot, flags, iswrite = Mmap.settings(file_desc, shared)
-            iswrite && grow && Mmap.grow!(io, offset, len)
-            # mmap the file
-            ptr = ccall(:jl_mmap, Ptr{Void}, (Ptr{Void}, Csize_t, Cint, Cint, Cint, FileOffset), C_NULL, mmaplen, prot, flags, file_desc, offset_page)
-            systemerror("memory mapping failed", reinterpret(Int,ptr) == -1)
-        end # @unix_only
-
-        @windows_only begin
-            name, readonly, create = settings(io)
-            szfile = convert(Csize_t, len + offset)
-            readonly && szfile > filesize(io) && throw(ArgumentError("unable to increase file size to $szfile due to read-only permissions"))
-            handle = create ? ccall(:CreateFileMappingW, stdcall, Ptr{Void}, (Cptrdiff_t, Ptr{Void}, Cint, Cint, Cint, Cwstring),
-                                    file_desc, C_NULL, readonly ? PAGE_READONLY : PAGE_READWRITE, szfile >> 32, szfile & typemax(UInt32), name) :
-                              ccall(:OpenFileMappingW, stdcall, Ptr{Void}, (Cint, Cint, Cwstring),
-                                readonly ? FILE_MAP_READ : FILE_MAP_WRITE, true, name)
-            handle == C_NULL && error("could not create file mapping: $(Base.FormatMessage())")
-            ptr = ccall(:MapViewOfFile, stdcall, Ptr{Void}, (Ptr{Void}, Cint, Cint, Cint, Csize_t),
-                            handle, readonly ? FILE_MAP_READ : FILE_MAP_WRITE, offset_page >> 32, offset_page & typemax(UInt32), (offset - offset_page) + len)
-            ptr == C_NULL && error("could not create mapping view: $(Base.FormatMessage())")
-        end # @windows_only
-        # convert mmapped region to Julia Array at `ptr + (offset - offset_page)` since file was mapped at offset_page
-        A = pointer_to_array(convert(Ptr{T}, UInt(ptr) + UInt(offset - offset_page)), dims)
-        array = new{T,N}(A, iswritable(io))
-        @unix_only finalizer(A, x -> systemerror("munmap", ccall(:munmap,Cint,(Ptr{Void},Int),ptr,mmaplen) != 0))
-        @windows_only finalizer(A, x -> begin
-            status = ccall(:UnmapViewOfFile, stdcall, Cint, (Ptr{Void},), ptr)!=0
-            status |= ccall(:CloseHandle, stdcall, Cint, (Ptr{Void},), handle)!=0
-            status || error("could not unmap view: $(Base.FormatMessage())")
-        end)
-        return array
-    end
+    @windows_only begin
+        name, readonly, create = settings(io)
+        szfile = convert(Csize_t, len + offset)
+        readonly && szfile > filesize(io) && throw(ArgumentError("unable to increase file size to $szfile due to read-only permissions"))
+        handle = create ? ccall(:CreateFileMappingW, stdcall, Ptr{Void}, (Cptrdiff_t, Ptr{Void}, Cint, Cint, Cint, Cwstring),
+                                file_desc, C_NULL, readonly ? PAGE_READONLY : PAGE_READWRITE, szfile >> 32, szfile & typemax(UInt32), name) :
+                          ccall(:OpenFileMappingW, stdcall, Ptr{Void}, (Cint, Cint, Cwstring),
+                            readonly ? FILE_MAP_READ : FILE_MAP_WRITE, true, name)
+        handle == C_NULL && error("could not create file mapping: $(Base.FormatMessage())")
+        ptr = ccall(:MapViewOfFile, stdcall, Ptr{Void}, (Ptr{Void}, Cint, Cint, Cint, Csize_t),
+                        handle, readonly ? FILE_MAP_READ : FILE_MAP_WRITE, offset_page >> 32, offset_page & typemax(UInt32), (offset - offset_page) + len)
+        ptr == C_NULL && error("could not create mapping view: $(Base.FormatMessage())")
+    end # @windows_only
+    # convert mmapped region to Julia Array at `ptr + (offset - offset_page)` since file was mapped at offset_page
+    A = pointer_to_array(convert(Ptr{T}, @compat UInt(ptr) + @compat UInt(offset - offset_page)), dims)
+    @unix_only finalizer(A, x -> systemerror("munmap", ccall(:munmap,Cint,(Ptr{Void},Int),ptr,mmaplen) != 0))
+    @windows_only finalizer(A, x -> begin
+        status = ccall(:UnmapViewOfFile, stdcall, Cint, (Ptr{Void},), ptr)!=0
+        status |= ccall(:CloseHandle, stdcall, Cint, (Ptr{Void},), handle)!=0
+        status || error("could not unmap view: $(Base.FormatMessage())")
+    end)
+    return A
 end
 
-Mmap.Array{T,N}(::Type{T}, file::AbstractString, dims::NTuple{N,Integer}=(filesize(file),), offset::Integer=Int64(0); grow::Bool=true, shared::Bool=true) =
-    open(io->Mmap.Array(T, io, dims, offset; grow=grow, shared=shared), file, isfile(file) ? "r+" : "w+")
-
-# using default type: UInt8
-Mmap.Array{N}(io::IO, dims::NTuple{N,Integer}=(filesize(io),), offset::Integer=position(io); grow::Bool=true, shared::Bool=true) =
-    Mmap.Array(UInt8, io, dims, offset; grow=grow, shared=shared)
-Mmap.Array{N}(file::AbstractString, dims::NTuple{N,Integer}=(filesize(io),), offset::Integer=Int64(0); grow::Bool=true, shared::Bool=true) =
-    open(io->Mmap.Array(UInt8, io, dims, offset; grow=grow, shared=shared), file, isfile(file) ? "r+" : "w+")
+mmap{T,N}(file::AbstractString, ::Type{T}=UInt8, dims::NTuple{N,Integer}=(filesize(file),), offset::Integer=@compat Int64(0); grow::Bool=true, shared::Bool=true) =
+    open(io->mmap(io, T, dims, offset; grow=grow, shared=shared), file, isfile(file) ? "r+" : "w+")
 
 # using a length argument instead of dims
-Mmap.Array(io::IO, len::Integer=filesize(io), offset::Integer=position(io); grow::Bool=true, shared::Bool=true) =
-    Mmap.Array(UInt8, io, (len,), offset; grow=grow, shared=shared)
-Mmap.Array(file::AbstractString, len::Integer=filesize(file), offset::Integer=Int64(0); grow::Bool=true, shared::Bool=true) =
-    open(io->Mmap.Array(UInt8, io, (len,), offset; grow=grow, shared=shared), file, isfile(file) ? "r+" : "w+")
+mmap{T}(io::IO, ::Type{T}, len::Integer, offset::Integer=position(io); grow::Bool=true, shared::Bool=true) =
+    mmap(io, T, (len,), offset; grow=grow, shared=shared)
+mmap{T}(file::AbstractString, ::Type{T}, len::Integer, offset::Integer=@compat Int64(0); grow::Bool=true, shared::Bool=true) =
+    open(io->mmap(io, T, (len,), offset; grow=grow, shared=shared), file, isfile(file) ? "r+" : "w+")
 
 # constructors for non-file-backed (anonymous) mmaps
-Mmap.Array{T,N}(::Type{T}, dims::NTuple{N,Integer}; shared::Bool=true) = Mmap.Array(T, AnonymousMmap(), dims, Int64(0); shared=shared)
-Mmap.Array{T}(::Type{T}, d::Integer...; shared::Bool=true) = Mmap.Array(T,convert(Tuple{Vararg{Int}}, d); shared=shared)
+mmap{T,N}(::Type{T}, dims::NTuple{N,Integer}; shared::Bool=true) = mmap(AnonymousMmap(), T, dims, @compat Int64(0); shared=shared)
+mmap{T}(::Type{T}, i::Integer...; shared::Bool=true) = mmap(AnonymousMmap(), T, convert(Tuple{Vararg{Int}},i), @compat Int64(0); shared=shared)
 
-Base.iswritable(m::Mmap.Array) = m.iswritable
-Base.isreadable(m::Mmap.Array) = true
-
-# Array interface
-Base.linearindexing{T<:Mmap.Array}(::Type{T}) = Base.LinearFast()
-Base.sizeof(a::Mmap.Array) = Base.elsize(a.array) * length(a)
-Base.size(m::Mmap.Array) = size(m.array)
-Base.similar(a::Mmap.Array, T, dims::Dims)      = Mmap.Array(T, dims)
-Base.similar{T}(a::Mmap.Array{T,1})             = Mmap.Array(T, size(a,1))
-Base.similar{T}(a::Mmap.Array{T,2})             = Mmap.Array(T, size(a,1), size(a,2))
-Base.similar{T}(a::Mmap.Array{T,1}, dims::Dims) = Mmap.Array(T, dims)
-Base.similar{T}(a::Mmap.Array{T,1}, m::Int)     = Mmap.Array(T, m)
-Base.similar{T}(a::Mmap.Array{T,1}, S)          = Mmap.Array(S, size(a,1))
-Base.similar{T}(a::Mmap.Array{T,2}, dims::Dims) = Mmap.Array(T, dims)
-Base.similar{T}(a::Mmap.Array{T,2}, m::Int)     = Mmap.Array(T, m)
-Base.similar{T}(a::Mmap.Array{T,2}, S)          = Mmap.Array(S, size(a,1), size(a,2))
-zeros{T}(::Type{T}, dims::Dims) = Mmap.Array(T, dims)
-zeros{T}(::Type{T}, m::Int)     = Mmap.Array(T, m)
-
-@inline Base.getindex{T}(S::Mmap.Array{T}) = getindex(S.array)::T
-@inline Base.getindex{T}(S::Mmap.Array{T}, I::Real) = getindex(S.array, I)::T
-@inline Base.getindex{T}(S::Mmap.Array{T}, I::AbstractArray) = getindex(S.array, I)::T
-@generated function Base.getindex(S::Mmap.Array, I::Union(Real,AbstractVector)...)
-    N = length(I)
-    Isplat = Expr[:(I[$d]) for d = 1:N]
-    quote
-        getindex(S.array, $(Isplat...))
+function mmap{T<:BitArray,N}(io::IOStream, ::Type{T}, dims::NTuple{N,Integer}=(filesize(io)-position(io),), offset::FileOffset=position(io); grow::Bool=true, shared::Bool=true)
+    n = prod(dims)
+    nc = Base.num_bit_chunks(n)
+    chunks = mmap(io, UInt64, (nc,), offset; grow=grow, shared=shared)
+    if !isreadonly(io)
+        chunks[end] &= Base._msk_end(n)
+    else
+        if chunks[end] != chunks[end] & Base._msk_end(n)
+            throw(ArgumentError("the given file does not contain a valid BitArray of size $(join(dims, 'x')) (open with \"r+\" mode to override)"))
+        end
     end
+    B = BitArray{N}(ntuple(i->0,N)...)
+    B.chunks = chunks
+    B.len = n
+    if N != 1
+        B.dims = dims
+    end
+    return B
 end
 
-const WRITEERROR = ArgumentError("mapped-memory is not writable")
-@inline Base.setindex!(S::Mmap.Array, x) = iswritable(S) ? setindex!(S.array, x) : throw(WRITEERROR)
-@inline Base.setindex!(S::Mmap.Array, x, I::Real) = iswritable(S) ? setindex!(S.array, x, I) : throw(WRITEERROR)
-@inline Base.setindex!(S::Mmap.Array, x, I::AbstractArray) = iswritable(S) ? setindex!(S.array, x, I) : throw(WRITEERROR)
-@generated function Base.setindex!(S::Mmap.Array, x, I::Union(Real,AbstractVector)...)
-    N = length(I)
-    Isplat = Expr[:(I[$d]) for d = 1:N]
-    quote
-        iswritable(S) ? setindex!(S.array, x, $(Isplat...)) : throw(WRITEERROR)
-    end
-end
+mmap{T<:BitArray,N}(file::AbstractString, ::Type{T}, dims::NTuple{N,Integer}=(filesize(file),), offset::Integer=@compat Int64(0); grow::Bool=true, shared::Bool=true) =
+    open(io->mmap(io, T, dims, offset; grow=grow, shared=shared), file, isfile(file) ? "r+" : "w+")
+
+# using a length argument instead of dims
+mmap{T<:BitArray}(io::IO, ::Type{T}, len::Integer=filesize(io), offset::Integer=position(io); grow::Bool=true, shared::Bool=true) =
+    mmap(io, T, (len,), offset; grow=grow, shared=shared)
+mmap{T<:BitArray}(file::AbstractString, ::Type{T}, len::Integer=filesize(file), offset::Integer=@compat Int64(0); grow::Bool=true, shared::Bool=true) =
+    open(io->mmap(io, T, (len,), offset; grow=grow, shared=shared), file, isfile(file) ? "r+" : "w+")
+
+# constructors for non-file-backed (anonymous) mmaps
+mmap{T<:BitArray,N}(::Type{T}, dims::NTuple{N,Integer}; shared::Bool=true) = mmap(AnonymousMmap(), T, dims, @compat Int64(0); shared=shared)
+mmap{T<:BitArray}(::Type{T}, i::Integer...; shared::Bool=true) = mmap(AnonymousMmap(), T, convert(Tuple{Vararg{Int}},i), @compat Int64(0); shared=shared)
 
 # msync flags for unix
 const MS_ASYNC = 1
 const MS_INVALIDATE = 2
 const MS_SYNC = 4
 
-sync!(m::Mmap.Array, flags::Integer=MS_SYNC) = sync!(pointer(m.array), length(m), flags)
-function sync!(ptr::Ptr{Void}, len::Integer, flags::Integer=MS_SYNC)
-    @unix_only systemerror("msync", ccall(:msync, Cint, (Ptr{Void}, Csize_t, Cint), ptr, len, flags) != 0)
+function sync!{T}(m::Base.Array{T}, flags::Integer=MS_SYNC)
+    @unix_only systemerror("msync", ccall(:msync, Cint, (Ptr{Void}, Csize_t, Cint), pointer(m), length(m)*sizeof(T), flags) != 0)
     @windows_only systemerror("could not FlushViewOfFile: $(Base.FormatMessage())",
-                    ccall(:FlushViewOfFile, stdcall, Cint, (Ptr{Void}, Csize_t), ptr, len) == 0)
+                    ccall(:FlushViewOfFile, stdcall, Cint, (Ptr{Void}, Csize_t), pointer(m), length(m)) == 0)
 end
-
-type Stream <: IO
-    data::Mmap.Array{UInt8,1}
-    pos::Int
-end
-
-Stream(file::AbstractString) = Stream(Mmap.Array(UInt8,file),1)
-
-Base.eof(m::Stream) = m.pos > length(m.data)
-Base.read(m::Stream,::Type{UInt8}) = (b = m.data[m.pos]; m.pos += 1; return b)
-Base.peek(m::Stream,::Type{UInt8}) = m.data[m.pos]
-Base.position(m::Stream) = m.pos
-Base.seekstart(m::Stream) = m.pos = 1
-Base.seek(m::Stream, pos) = m.pos = pos
-const NEWLINE = UInt8('\n')
-function Base.readline(m::Stream)
-    buf = IOBuffer()
-    while !eof(m)
-        b = read(m,UInt8)
-        write(buf,b)
-        b == NEWLINE && break
-    end
-    return takebuf_string(buf)
-end
-function Base.readline(m::Stream,q::UInt8)
-    buf = IOBuffer()
-    while !eof(m)
-        b = read(m,UInt8)
-        write(buf,b)
-        if b == q
-            b = read(m,UInt8)
-            write(buf,b)
-            while !eof(m) && b != q
-                b = read(m,UInt8)
-                write(buf,b)
-            end
-        else
-            b == NEWLINE && break
-        end
-    end
-    return takebuf_string(buf)
-end
+sync!(B::Base.BitArray, flags::Integer=MS_SYNC) = sync!(B.chunks, flags)
 
 end # module
