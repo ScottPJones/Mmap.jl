@@ -93,7 +93,7 @@ settings(io::IO) = convert(Ptr{Cwchar_t},C_NULL), isreadonly(io), true
 end # @windows_only
 
 # core impelementation of mmap
-function mmap{T,N}(io::IO, ::Type{T}=UInt8, dims::NTuple{N,Integer}=(filesize(io)-position(io),), offset::Integer=position(io); grow::Bool=true, shared::Bool=true)
+function mmap{T,N}(io::IO, ::Type{T}=UInt8, dims::NTuple{N,Integer}=(div(filesize(io)-position(io),sizeof(T)),), offset::Integer=position(io); grow::Bool=true, shared::Bool=true)
     # check inputs
     isopen(io) || throw(ArgumentError("$io must be open to mmap"))
     isbits(T)  || throw(ArgumentError("unable to mmap $T; must satisfy isbits(T) == true"))
@@ -143,7 +143,7 @@ function mmap{T,N}(io::IO, ::Type{T}=UInt8, dims::NTuple{N,Integer}=(filesize(io
     return A
 end
 
-mmap{T,N}(file::AbstractString, ::Type{T}=UInt8, dims::NTuple{N,Integer}=(filesize(file),), offset::Integer=@compat Int64(0); grow::Bool=true, shared::Bool=true) =
+mmap{T,N}(file::AbstractString, ::Type{T}=UInt8, dims::NTuple{N,Integer}=(div(filesize(file),sizeof(T)),), offset::Integer=@compat Int64(0); grow::Bool=true, shared::Bool=true) =
     open(io->mmap(io, T, dims, offset; grow=grow, shared=shared), file, isfile(file) ? "r+" : "w+")
 
 # using a length argument instead of dims
